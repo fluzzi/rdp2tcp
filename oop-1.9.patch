@@ -1,0 +1,513 @@
+diff -Naur rdesktop1.9/channels.c rdesktop1.9.1/channels.c
+--- rdesktop1.9/channels.c	2019-09-17 11:58:24.000000000 -0300
++++ rdesktop1.9.1/channels.c	2021-08-13 13:00:40.952761307 -0300
+@@ -19,6 +19,7 @@
+    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+ 
++#include <unistd.h>
+ #include "rdesktop.h"
+ 
+ #define MAX_CHANNELS			6
+@@ -46,7 +47,7 @@
+ */
+ 
+ VCHANNEL *
+-channel_register(char *name, uint32 flags, void (*callback) (STREAM))
++channel_register(char *name, uint32 flags, void (*callback) (STREAM,char*))
+ {
+ 	VCHANNEL *channel;
+ 
+@@ -206,7 +207,7 @@
+ 	if ((flags & CHANNEL_FLAG_FIRST) && (flags & CHANNEL_FLAG_LAST))
+ 	{
+ 		/* single fragment - pass straight up */
+-		channel->process(s);
++		channel->process(s, channel->name);
+ 	}
+ 	else
+ 	{
+@@ -225,7 +226,75 @@
+ 		{
+ 			s_mark_end(in);
+ 			s_seek(in, 0);
+-			channel->process(in);
++			channel->process(in, channel->name);
++		}
++	}
++}
++
++/* Generic callback for delivering data to third party add-ins */
++void addin_callback(STREAM s, char *name)
++{
++	pid_t pid;
++	int pipe_read;
++	int pipe_write;
++	uint32 blocksize;
++
++	/* s->p is the start and s->end is the end plus 1 */
++	blocksize = s->end - s->p;
++
++	lookup_addin(name, &pid, &pipe_read, &pipe_write);
++	if (!pid)
++		perror("Can't locate addin");
++	else
++	{
++		/* Prepend the block with the block size so the
++		add-in can identify blocks */
++		write(pipe_write, &blocksize, sizeof(uint32));
++		write(pipe_write, s->p, blocksize);
++	}
++}
++
++/* Add the add-in pipes to the set of file descriptors */
++void addin_add_fds(int *n, fd_set * rfds)
++{
++	extern ADDIN_DATA addin_data[];
++	extern int addin_count;
++
++	int i;
++
++	for (i = 0; i < addin_count; i++)
++	{
++		FD_SET(addin_data[i].pipe_read, rfds);
++		*n = MAX(*n, addin_data[i].pipe_read);
++	}
++}
++
++/* Check the add-in pipes for data to write */
++void addin_check_fds(fd_set * rfds)
++{
++	extern ADDIN_DATA addin_data[];
++	extern int addin_count;
++
++	int i;
++	char buffer[1024];
++	ssize_t bytes_read;
++	STREAM s;
++
++	for (i = 0; i < addin_count; i++)
++	{
++		if (FD_ISSET(addin_data[i].pipe_read, rfds))
++		{
++			bytes_read = read(addin_data[i].pipe_read, buffer, 1024);
++			if (bytes_read > 0)
++			{
++				/* write to appropriate vc */
++				s = channel_init(addin_data[i].vchannel, bytes_read);
++				memcpy(s->p, buffer, bytes_read);
++				s->p += bytes_read;
++				s->end = s->p;
++
++				channel_send(s, addin_data[i].vchannel);
++			}
+ 		}
+ 	}
+ }
+diff -Naur rdesktop1.9/cliprdr.c rdesktop1.9.1/cliprdr.c
+--- rdesktop1.9/cliprdr.c	2019-06-13 09:10:15.000000000 -0300
++++ rdesktop1.9.1/cliprdr.c	2021-08-13 12:59:47.920664534 -0300
+@@ -114,7 +114,7 @@
+ }
+ 
+ static void
+-cliprdr_process(STREAM s)
++cliprdr_process(STREAM s, char *name)
+ {
+ 	uint16 type, status;
+ 	uint32 length, format;
+diff -Naur rdesktop1.9/.cvsignore rdesktop1.9.1/.cvsignore
+--- rdesktop1.9/.cvsignore	1969-12-31 21:00:00.000000000 -0300
++++ rdesktop1.9.1/.cvsignore	2019-01-02 11:06:18.000000000 -0300
+@@ -0,0 +1,8 @@
++rdesktop
++rdp2vnc
++autom4te.cache
++Makefile
++config.log
++config.status
++configure
++rdesktop*.tar.gz
+diff -Naur rdesktop1.9/lspci.c rdesktop1.9.1/lspci.c
+--- rdesktop1.9/lspci.c	2019-06-13 09:10:15.000000000 -0300
++++ rdesktop1.9.1/lspci.c	2021-08-13 12:59:47.920664534 -0300
+@@ -130,7 +130,7 @@
+ 
+ /* Process new data from the virtual channel */
+ static void
+-lspci_process(STREAM s)
++lspci_process(STREAM s, char *name)
+ {
+ 	unsigned int pkglen;
+ 	static char *rest = NULL;
+diff -Naur rdesktop1.9/proto.h rdesktop1.9.1/proto.h
+--- rdesktop1.9/proto.h	2019-06-13 09:10:15.000000000 -0300
++++ rdesktop1.9.1/proto.h	2021-08-13 12:59:47.932664556 -0300
+@@ -52,7 +52,7 @@
+ BRUSHDATA *cache_get_brush_data(uint8 colour_code, uint8 idx);
+ void cache_put_brush_data(uint8 colour_code, uint8 idx, BRUSHDATA * brush_data);
+ /* channels.c */
+-VCHANNEL *channel_register(char *name, uint32 flags, void (*callback) (STREAM));
++VCHANNEL *channel_register(char *name, uint32 flags, void (*callback) (STREAM,char *));
+ STREAM channel_init(VCHANNEL * channel, uint32 length);
+ void channel_send(STREAM s, VCHANNEL * channel);
+ void channel_process(STREAM s, uint16 mcs_channel);
+@@ -371,6 +371,21 @@
+ void scard_reset_state();
+ void scard_release_all_contexts(void);
+ 
++/* External addins */
++void init_external_addin(char * addin_name, char * addin_path, char * args, ADDIN_DATA * addin_data);
++
++/* Generic callback for delivering data to third party add-ins */
++void addin_callback(STREAM s, char *name);
++
++/* Find an external add-in registration by virtual channel name */
++void lookup_addin(char *name, pid_t * pid, int * pipe_read, int * pipe_write);
++
++/* Add external add-in pipes to the set of listened file descriptors */
++void addin_add_fds(int *n, fd_set * rfds);
++
++/* Read any available data from external add-in pipes */
++void addin_check_fds(fd_set *rfds);
++
+ /* *INDENT-OFF* */
+ #ifdef __cplusplus
+ }
+diff -Naur rdesktop1.9/rdesktop.c rdesktop1.9.1/rdesktop.c
+--- rdesktop1.9/rdesktop.c	2019-09-11 11:33:07.000000000 -0300
++++ rdesktop1.9.1/rdesktop.c	2021-08-13 13:52:25.206504753 -0300
+@@ -160,6 +160,9 @@
+ extern uint32 g_num_devices;
+ extern char *g_rdpdr_clientname;
+ 
++ADDIN_DATA addin_data[MAX_ADDINS];
++int addin_count = 0;
++
+ /* Display usage information */
+ static void
+ usage(char *program)
+@@ -247,6 +250,9 @@
+ 	fprintf(stderr,
+ 		"                   \"AKS\"              -> Device vendor name                 \n");
+ #endif
++	fprintf(stderr,
++		"         '-r addin:<channelname>:</path/to/executable>[:arg1[:arg2:]...]': enable third\n");
++	fprintf(stderr, "                      party virtual channel add-in.\n");
+ 	fprintf(stderr, "   -0: attach to console\n");
+ 	fprintf(stderr, "   -4: use RDP version 4\n");
+ 	fprintf(stderr, "   -5: use RDP version 5 (default)\n");
+@@ -776,10 +782,12 @@
+ 	char domain[256];
+ 	char shell[256];
+ 	char directory[256];
+-	RD_BOOL prompt_password, deactivated;
++	RD_BOOL prompt_password, deactivated, sent_sigusr1;
+ 	struct passwd *pw;
+ 	uint32 flags, ext_disc_reason = 0;
+ 	char *p;
++	char *addin_name;
++	char *addin_path;
+ 	int c;
+ 	char *locale = NULL;
+ 	int username_option = 0;
+@@ -1012,8 +1020,58 @@
+ 				break;
+ 
+ 			case 'r':
++				if (str_startswith(optarg, "addin"))
++				{
++					if (addin_count >= MAX_ADDINS)
++					{
++						error("Add-ins data table full, increase MAX_ADDINS\n");
++						return 1;
++					}
+ 
+-				if (str_startswith(optarg, "sound"))
++					optarg += 5;
++
++					if (*optarg == ':')
++					{
++						addin_name = optarg + 1;
++						if (*addin_name != '\0')
++						{
++							addin_path = next_arg(addin_name, ':');
++						}
++						else
++						{
++							addin_path = 0;
++						}
++						if (addin_path != 0)
++						{
++							p = next_arg(addin_path, ':');
++						}
++						if (*addin_name != '\0' && addin_path != 0 && *addin_path != '\0')
++						{
++							init_external_addin(addin_name, addin_path,
++									p, &addin_data[addin_count]);
++							if (addin_data[addin_count].pid != 0)
++							{
++								addin_count++;
++							}
++							else
++							{
++								error("Failed to initialise add-in [%s]\n", addin_name);
++								return 1;
++							}
++						}
++						else
++						{
++							usage(argv[0]);
++							return(1);
++						}
++					}
++					else
++					{
++						usage(argv[0]);
++						return(1);
++					}
++				}
++				else if (str_startswith(optarg, "sound"))
+ 				{
+ 					optarg += 5;
+ 
+@@ -1494,6 +1552,20 @@
+ 	cache_save_state();
+ 	ui_deinit();
+ 
++	/* Send a SIGUSR1 to all addins to close and sleep for a couple of secs
++	   to give them a chance to stop */
++	sent_sigusr1=False;
++	for (c = 0; c < addin_count; c++)
++	{
++		if (addin_data[c].pid != 0)
++		{
++			kill(addin_data[c].pid,SIGUSR1);
++			sent_sigusr1=True;
++		}
++	}
++	if (sent_sigusr1)
++		sleep(2);
++
+ 	if (g_user_quit)
+ 		return EXRD_WINDOW_CLOSED;
+ 
+@@ -2164,3 +2236,111 @@
+ 		return False;
+ 	return True;
+ }
++
++/* Initialise external addin */
++void init_external_addin(char * addin_name, char * addin_path, char * args, ADDIN_DATA * addin_data)
++{
++	char *p;
++	char *current_arg;
++	char * argv[256];
++	char argv_buffer[256][256];
++	int i;
++	int readpipe[2],writepipe[2];
++	pid_t child;
++
++	/* Initialise addin structure */
++	memset(addin_data, 0, sizeof(ADDIN_DATA));
++	/* Go through the list of args, adding each to argv */
++	argv[0] = addin_path;
++	i = 1;
++	p=current_arg=args;
++	while (current_arg != 0 && current_arg[0] != '\0')
++	{
++		p=next_arg(p, ':');;
++		if (p != 0 && *p != '\0')
++			*(p - 1) = '\0';
++		strcpy(argv_buffer[i], current_arg);
++		argv[i]=argv_buffer[i];
++		i++;
++		current_arg=p;
++	}
++	argv[i] = NULL;
++
++
++	/* Create pipes */
++	if (pipe(readpipe) < 0 || pipe(writepipe) < 0)
++	{
++		perror("pipes for addin");
++		return;
++	}
++
++	/* Fork process */
++	if ((child = fork()) < 0)
++	{
++		perror("fork for addin");
++		return;
++	}
++
++	/* Child */
++	if (child == 0)
++	{
++		/* Set stdin and stdout of child to relevant pipe ends */
++		dup2(writepipe[0],0);
++		dup2(readpipe[1],1);
++
++		/* Close all fds as they are not needed now */
++		close(readpipe[0]);
++		close(readpipe[1]);
++		close(writepipe[0]);
++		close(writepipe[1]);
++		execvp((char *)argv[0], (char **)argv);
++		perror("Error executing child");
++		_exit(128);
++	}
++	else
++	{
++		strcpy(addin_data->name, addin_name);
++		/* Close child end fd's */
++		close(readpipe[1]);
++		close(writepipe[0]);
++		addin_data->pipe_read=readpipe[0];
++		addin_data->pipe_write=writepipe[1];
++		addin_data->vchannel=channel_register(addin_name,
++						CHANNEL_OPTION_INITIALIZED |
++						CHANNEL_OPTION_ENCRYPT_RDP |	
++						CHANNEL_OPTION_COMPRESS_RDP,
++						addin_callback);
++		if (!addin_data->vchannel)
++		{
++			perror("Channel register failed");
++			return;
++		}
++		else
++			addin_data->pid=child;
++
++	}
++
++}
++
++/* Find an external add-in registration by virtual channel name */
++void lookup_addin(char *name, pid_t * pid, int * pipe_read, int * pipe_write)
++{
++	int i=0;
++
++	*pid = 0;
++
++	while (i < addin_count && !*pid)
++	{
++		if (!strcmp(name,addin_data[i].name))
++		{
++			*pid=addin_data[i].pid;
++			*pipe_read=addin_data[i].pipe_read;
++			*pipe_write=addin_data[i].pipe_write;
++		}
++		i++;
++
++	}
++
++	return;
++
++}
+diff -Naur rdesktop1.9/rdesktop.h rdesktop1.9.1/rdesktop.h
+--- rdesktop1.9/rdesktop.h	2019-06-13 09:10:15.000000000 -0300
++++ rdesktop1.9.1/rdesktop.h	2021-08-13 13:56:34.870664245 -0300
+@@ -138,6 +138,8 @@
+ #define EXRD_WINDOW_CLOSED  62
+ #define EXRD_UNKNOWN        63
+ 
++#define MAX_ADDINS 20
++
+ #define STRNCPY(dst,src,n)	{ strncpy(dst,src,n-1); dst[n-1] = 0; }
+ 
+ #ifndef MIN
+diff -Naur rdesktop1.9/rdpdr.c rdesktop1.9.1/rdpdr.c
+--- rdesktop1.9/rdpdr.c	2019-06-13 09:10:15.000000000 -0300
++++ rdesktop1.9.1/rdpdr.c	2021-08-13 12:59:47.936664564 -0300
+@@ -885,7 +885,7 @@
+ }
+ 
+ static void
+-rdpdr_process(STREAM s)
++rdpdr_process(STREAM s, char *name)
+ {
+ 	uint32 handle;
+ 	uint16 vmin;
+diff -Naur rdesktop1.9/rdpsnd.c rdesktop1.9.1/rdpsnd.c
+--- rdesktop1.9/rdpsnd.c	2019-09-17 11:58:24.000000000 -0300
++++ rdesktop1.9.1/rdpsnd.c	2021-08-13 12:59:47.936664564 -0300
+@@ -387,7 +387,7 @@
+ }
+ 
+ static void
+-rdpsnd_process(STREAM s)
++rdpsnd_process(STREAM s, char *name)
+ {
+ 	while (!s_check_end(s))
+ 	{
+@@ -453,7 +453,7 @@
+ }
+ 
+ static void
+-rdpsnddbg_process(STREAM s)
++rdpsnddbg_process(STREAM s, char *name)
+ {
+ 	unsigned int pkglen;
+ 	static char *rest = NULL;
+diff -Naur rdesktop1.9/seamless.c rdesktop1.9.1/seamless.c
+--- rdesktop1.9/seamless.c	2019-06-13 09:10:15.000000000 -0300
++++ rdesktop1.9.1/seamless.c	2021-08-13 12:59:47.936664564 -0300
+@@ -372,7 +372,7 @@
+ 
+ 
+ static void
+-seamless_process(STREAM s)
++seamless_process(STREAM s, char *name)
+ {
+ 	unsigned int pkglen;
+ 	char *buf;
+diff -Naur rdesktop1.9/types.h rdesktop1.9.1/types.h
+--- rdesktop1.9/types.h	2019-06-13 09:10:15.000000000 -0300
++++ rdesktop1.9.1/types.h	2021-08-13 12:59:47.936664564 -0300
+@@ -169,7 +169,7 @@
+ 	char name[8];
+ 	uint32 flags;
+ 	struct stream in;
+-	void (*process) (STREAM);
++	void (*process) (STREAM,char *);
+ }
+ VCHANNEL;
+ 
+@@ -311,6 +311,15 @@
+ }
+ FILEINFO;
+ 
++typedef struct _ADDIN_DATA
++{
++	char name[255];
++	pid_t pid;
++	int pipe_read;
++	int pipe_write;
++	VCHANNEL *vchannel;
++} ADDIN_DATA;
++
+ typedef RD_BOOL(*str_handle_lines_t) (const char *line, void *data);
+ 
+ typedef enum
+diff -Naur rdesktop1.9/xwin.c rdesktop1.9.1/xwin.c
+--- rdesktop1.9/xwin.c	2019-06-13 09:10:15.000000000 -0300
++++ rdesktop1.9.1/xwin.c	2021-08-13 13:48:15.393279335 -0300
+@@ -3083,6 +3083,9 @@
+ 	/* add ctrl slaves handles */
+ 	ctrl_add_fds(&n, &rfds);
+ 
++    addin_add_fds(&n, &rfds);
++
++
+ 	n++;
+ 
+ 	ret = select(n, &rfds, &wfds, NULL, &tv);
+@@ -3110,6 +3113,8 @@
+ 
+ 	ctrl_check_fds(&rfds, &wfds);
+ 
++    addin_check_fds(&rfds);
++
+ 	if (FD_ISSET(rdp_socket, &rfds))
+ 		return True;
+ 
