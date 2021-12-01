@@ -1,0 +1,285 @@
+--- rdp2tcp/client/channel.c-orig	2010-10-29 11:40:59.000000000 +0200
++++ rdp2tcp/client/channel.c	2017-11-20 11:22:26.657403376 +0100
+@@ -95,7 +95,7 @@
+ {
+ 	ssize_t r;
+ 	char *ptr;
+-	unsigned int msglen, avail;
++	unsigned int len, msglen, avail;
+ 	
+ 	//trace_chan("");
+ 
+@@ -113,10 +113,11 @@
+ 	if (!ptr)
+ 		return error("failed to reserve channel memory");
+ 
++	len = msglen;
+ 	do {
+ 		r = read(RDP_FD_IN, ptr, msglen);
+ 		//trace_chan("r=%u/%u", r, msglen);
+-		if (r < 0)
++		if (r <= 0)
+ 			goto chan_read_err;
+ 
+ #ifdef DEBUG
+@@ -133,7 +134,7 @@
+ 		msglen -= r;
+ 	} while (msglen > 0);
+ 
+-	iobuf_commit(&vc.ibuf, r);
++	iobuf_commit(&vc.ibuf, len);
+ 	commands_parse(&vc.ibuf);
+ 	time(&vc.ts);
+ 
+--- rdp2tcp/client/controller.c-orig	2010-10-29 11:40:59.000000000 +0200
++++ rdp2tcp/client/controller.c	2017-11-20 11:22:26.657403376 +0100
+@@ -151,7 +151,7 @@
+ 				break;
+ 
+ 			case NETSOCK_TUNCLI:
+-				if (!ns->state != NETSTATE_CONNECTED) {
++				if (ns->state != NETSTATE_CONNECTED) {
+ 					ret = controller_answer(cli, "tuncli  %s tid=%hu",
+ 						host1, ns->tid);
+ 					break;
+--- rdp2tcp/common/msgparser.c-orig	2010-10-29 11:40:57.000000000 +0200
++++ rdp2tcp/common/msgparser.c	2017-11-20 11:22:26.657403376 +0100
+@@ -34,6 +34,30 @@
+ extern int debug_level;
+ extern const cmdhandler_t cmd_handlers[];
+ 
++/*
++static char const hexdigit[] = "0123456789abcdef";
++
++static void dumpData(void *data, unsigned length) {
++    unsigned const limit = 98;
++    char hex[2];
++    unsigned l = length>limit ? limit/2 : length;
++    for (unsigned i=0; i<l; ++i) {
++	hex[0] = hexdigit[(((char *)data)[i]>>4)&0xf];
++	hex[1] = hexdigit[((char *)data)[i]&0xf];
++        printf("%.2s", hex);
++    }
++    if (length>limit) {
++        printf("...");
++        for (unsigned i=length-l; i<length; ++i) {
++	    hex[0] = hexdigit[(((char *)data)[i]>>4)&0xf];
++	    hex[1] = hexdigit[((char *)data)[i]&0xf];
++            printf("%.2s", hex);
++	}
++    }
++    puts("");
++}
++*/
++
+ /**
+  * parse rdp2tcp commands and call specific handlers
+  * @param[in] ibuf input buffer
+@@ -43,6 +67,7 @@
+ {
+ 	unsigned char cmd, *data;
+ 	unsigned int off, msg_len, avail;
++	int rc = 0;
+ 	static const unsigned char r2t_min_size[R2TCMD_MAX] = {
+ 		3, // R2TCMD_CONN
+ 		2, // R2TCMD_CLOSE
+@@ -62,6 +87,8 @@
+ 	data  = iobuf_dataptr(ibuf);
+ 	avail = iobuf_datalen(ibuf);
+ 	debug(1, "commands_parse(avail=%u)", avail);
++	//printf(">%8u ", (unsigned)avail);
++	//dumpData(data, avail);
+ 
+ 	// for each command
+ 	while (off + 5 < avail) {
+@@ -76,27 +103,35 @@
+ 		off += 4;
+ 
+ 		cmd = data[off];
+-		if (cmd >= R2TCMD_MAX)
+-			return error("invalid command id 0x%02x", cmd);
++		unsigned char *msg = data+off;
++		off += msg_len;
++		if (cmd >= R2TCMD_MAX) {
++			rc = error("invalid command id 0x%02x", cmd);
++			break;
++		}
+ 
+-		if (msg_len < (unsigned int)r2t_min_size[cmd])
+-			return error("command 0x%02x too short 0x%08x < 0x%08x", 
++		if (msg_len < (unsigned int)r2t_min_size[cmd]) {
++			rc = error("command 0x%02x too short 0x%08x < 0x%08x", 
+ 					cmd, msg_len, (unsigned int)r2t_min_size[cmd]);
++			break;
++		}
+ 
+-		if (!cmd_handlers[cmd])
+-			return error("command 0x%02x not supported", cmd);
++		if (!cmd_handlers[cmd]) {
++			rc = error("command 0x%02x not supported", cmd);
++			break;
++		}
+ 
+ 		// call specific command handler
+-		if (cmd_handlers[cmd]((const r2tmsg_t*)(data+off), msg_len))
+-			return -1;
+-
+-		off += msg_len;
++		if (cmd_handlers[cmd]((const r2tmsg_t*)msg, msg_len)) {
++			rc = -1;
++			break;
++		}
+ 	}
+ 
+ 	if (off > 0)
+ 		iobuf_consume(ibuf, off);
+ 
+-	return 0;
++	return rc;
+ }
+ 
+ // R2TERR_xxx error strings
+--- rdp2tcp/common/nethelper.c-orig	2010-10-29 11:40:58.000000000 +0200
++++ rdp2tcp/common/nethelper.c	2017-11-20 11:46:45.565868184 +0100
+@@ -24,6 +24,7 @@
+ #include "debug.h"
+ 
+ #include <stdio.h>
++#include <stdlib.h>
+ #ifndef _WIN32
+ #include <string.h>
+ #include <fcntl.h>
+@@ -107,16 +108,16 @@
+ 	
+ #ifndef _WIN32
+ 	snprintf(buffer, sizeof(buffer)-1, "%s (%s)", x,
+-				(ret == NETERR_RESOLVE ? gai_strerror(err) : strerror(err)));
++				(ret == NETERR_RESOLVE ? gai_strerror(err) : err!=NETERR_CLOSED ? strerror(abs(err)) : "Connection closed"));
+ #else
+ 	msg[0] = 0;
+ 	FormatMessageA(FORMAT_MESSAGE_FROM_SYSTEM
+ 						|FORMAT_MESSAGE_IGNORE_INSERTS
+ 						|FORMAT_MESSAGE_MAX_WIDTH_MASK,
+-						NULL, err,
++						NULL, abs(err),
+ 						MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
+ 						(LPSTR)msg, sizeof(msg), NULL);
+-	snprintf(buffer, sizeof(buffer)-1, "%s (%s)", x, msg);
++	snprintf(buffer, sizeof(buffer)-1, "%s (%s)", x, err!=NETERR_CLOSED ? msg : "Connection closed");
+ #endif
+ 	return (const char *) buffer;
+ }
+--- rdp2tcp/common/print.c-orig	2010-10-29 11:40:57.000000000 +0200
++++ rdp2tcp/common/print.c	2017-11-20 11:22:26.658403379 +0100
+@@ -169,7 +169,7 @@
+  */
+ void print_xfer(const char *name, char rw, unsigned int size)
+ {
+-	info(1, (rw=='r'?"%-6s          < %-8u":"%-6s %8u >"), name, size);
++	debug(1, (rw=='r'?"%-6s          < %-8u":"%-6s %8u >"), name, size);
+ }
+ 
+ #ifdef DEBUG
+--- rdp2tcp/server/aio.c-orig	2010-12-14 11:04:12.000000000 +0100
++++ rdp2tcp/server/aio.c	2017-11-20 11:22:26.658403379 +0100
+@@ -61,7 +61,7 @@
+ 
+ 	rio->io.hEvent = evt1;
+ 	wio->io.hEvent = evt2;
+-	rio->min_io_size = 1024;
++	rio->min_io_size = 2048;
+ 	wio->min_io_size = 0;
+ 
+ 	return 0;
+@@ -108,6 +108,7 @@
+ 	len = 0;
+ 
+ 	if (rio->pending) {
++		//printf("read pending\n");
+ 		rio->pending = 0;
+ 		if (!GetOverlappedResult(fd, &rio->io, &len, FALSE)) {
+ 			ResetEvent(rio->io.hEvent);
+@@ -143,6 +144,7 @@
+ 	if (ReadFile(fd, data, (DWORD)avail, &r, &rio->io)) {
+ 
+ 		trace_chan("%i/%i overlap=%u", r, avail, len);
++		//printf("%i/%i overlap=%u\n", (int)r, (int)avail, (unsigned)len);
+ 		if (r == 0) {
+ 			ResetEvent(rio->io.hEvent);
+ 			return error("fd closed");
+@@ -167,6 +169,7 @@
+ 
+ 			case ERROR_IO_PENDING:
+ 				rio->pending = 1;
++				//printf("pending:= 1\n");
+ 				break;
+ 
+ 			case ERROR_BROKEN_PIPE:
+--- rdp2tcp/server/channel.c-orig	2010-10-29 11:41:02.000000000 +0200
++++ rdp2tcp/server/channel.c	2017-11-20 11:22:26.658403379 +0100
+@@ -144,7 +144,7 @@
+ 		vc.connected ^= 1;
+ 	}
+ 
+-	return 0;
++	return ret;
+ }
+ 
+ /**
+--- rdp2tcp/server/events.c-orig	2010-10-29 11:41:02.000000000 +0200
++++ rdp2tcp/server/events.c	2017-11-20 11:24:13.077743985 +0100
+@@ -148,13 +148,13 @@
+ 	if ((ret == 1) && (off == 0))
+ 		return EVT_CHAN_READ;
+ 
+-		tun = tunnel_lookup(evtid_to_tunid[off+ret]);
+-		if (!tun)
+-			return error("invalid tunnel event 0x%02x", evtid_to_tunid[off+ret]);
++	tun = tunnel_lookup(evtid_to_tunid[off+ret]);
++	if (!tun)
++		return error("invalid tunnel event 0x%02x", evtid_to_tunid[off+ret]);
+ 
+-		*out_tun = tun;
+-		*out_h   = all_events[off+ret];
+-		return EVT_TUNNEL;
++	*out_tun = tun;
++	*out_h   = all_events[off+ret];
++	return EVT_TUNNEL;
+ }
+ 
+ 
+--- rdp2tcp/server/Makefile.mingw32-orig	2010-12-17 13:44:38.000000000 +0100
++++ rdp2tcp/server/Makefile.mingw32	2017-11-20 11:22:26.658403379 +0100
+@@ -1,7 +1,8 @@
+ BIN=rdp2tcp.exe
+ CC=i586-mingw32msvc-gcc
++CC=i686-w64-mingw32-gcc
+ CFLAGS=-Wall -g \
+-		 -D_WIN32_WINNT=0x0501 -DDEBUG \
++		 -D_WIN32_WINNT=0x0501 \
+ 		 -I../common
+ 
+ # -D_WIN32_WINNT=0x0501
+--- rdp2tcp/server/tunnel.c-orig	2010-10-29 11:41:02.000000000 +0200
++++ rdp2tcp/server/tunnel.c	2017-11-20 11:22:26.658403379 +0100
+@@ -67,11 +67,9 @@
+  */
+ static unsigned char tunnel_generate_id(void)
+ {
+-	int ok;
+ 	unsigned char tid;
+ 	static unsigned char last_tid = 0xff;
+ 
+-	ok = 1;
+ 	for (tid=last_tid+1; tid!=last_tid; ++tid) {
+ 		if (!tunnel_lookup(tid)) {
+ 			last_tid = tid;
+@@ -504,6 +502,8 @@
+ 			if ((ret >= 0) && (evt & FD_READ)) {
+ 				debug(0, "FD_READ");
+ 				ret = tunnel_sockrecv_event(tun);
++				if (evt & FD_CLOSE)
++				    while ((ret = tunnel_sockrecv_event(tun)) > 0);
+ 			}
+ 
+ 			if (evt & FD_CLOSE) {
